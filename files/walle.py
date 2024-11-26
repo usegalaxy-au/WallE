@@ -534,8 +534,9 @@ class JWDGetter:
                 self.backends,
                 job.runner_name,
             )
-        except ValueError:
-            logger.warning(f"Job Working Directory not found for job {job}")
+        except ValueError as exc:
+            logger.warning("Job Working Directory not found for job"
+                           f" {job.galaxy_id}. Exception:\n{exc}")
             return ""
 
 
