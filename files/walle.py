@@ -16,6 +16,8 @@ import subprocess
 import sys
 import time
 import zlib
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Dict, List, Union
 
 import galaxy_jwd
@@ -34,6 +36,10 @@ If you think your account was deleted due to an error, please contact
 """
 ONLY_ONE_INSTANCE = "The other must be an instance of the Severity class"
 
+# Number of days before repeating slack alert for the same JWD
+SLACK_NOTIFY_PERIOD_DAYS = 7
+SLACK_URL = "https://slack.com/api/chat.postMessage"
+
 UserId = str
 UserMail = str
 UserIdMail = Dict[UserId, UserMail]
@@ -45,6 +51,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 GXADMIN_PATH = os.getenv("GXADMIN_PATH", "/usr/local/bin/gxadmin")
+NOTIFICATION_HISTORY_FILE = os.getenv(
+    "WALLE_NOTIFICATION_HISTORY_FILE", "/tmp/walle-notifications.txt"
+)
 
 
 def convert_arg_to_byte(mb: str) -> int:
@@ -53,6 +62,76 @@ def convert_arg_to_byte(mb: str) -> int:
 
 def convert_arg_to_seconds(hours: str) -> float:
     return float(hours) * 60 * 60
+
+
+@dataclass
+class Record:
+    date: str
+    jwd: str
+
+    def __post_init__(self):
+        if not (
+            isinstance(self.date, str) and isinstance(self.jwd, (str, pathlib.Path))
+        ):
+            raise ValueError
+        self.jwd = str(self.jwd)
+        datetime.fromisoformat(self.date)  # will raise ValueError if invalid
+
+
+class NotificationHistory:
+    """Record of Slack notifications to avoid spamming users."""
+
+    def __init__(self, record_file: str) -> None:
+        self.record_file = pathlib.Path(record_file)
+        if not self.record_file.exists():
+            self.record_file.touch()
+        self._truncate_records()
+
+    def _get_jwds(self) -> List[str]:
+        return [record.jwd for record in self._read_records()]
+
+    def _read_records(self) -> List[Record]:
+        try:
+            with open(self.record_file, "r") as f:
+                records = [
+                    Record(*line.strip().split("\t"))
+                    for line in f.readlines()
+                    if line.strip()
+                ]
+        except ValueError:
+            logger.warning(
+                f"Invalid records found in {self.record_file}. The"
+                " file will be purged. This may result in duplicate Slack"
+                " notifications."
+            )
+            self._purge_records()
+            return []
+        return records
+
+    def _write_record(self, jwd: str) -> None:
+        with open(self.record_file, "a") as f:
+            f.write(f"{datetime.now()}\t{jwd}\n")
+
+    def _purge_records(self) -> None:
+        self.record_file.unlink()
+        self.record_file.touch()
+
+    def _truncate_records(self) -> None:
+        """Truncate older records."""
+        records = self._read_records()
+        with open(self.record_file, "w") as f:
+            for record in records:
+                if datetime.fromisoformat(record.date) > datetime.now() - timedelta(
+                    days=SLACK_NOTIFY_PERIOD_DAYS
+                ):
+                    f.write(f"{record.date}\t{record.jwd}\n")
+
+    def contains(self, jwd: Union[pathlib.Path, str]) -> bool:
+        jwd = str(jwd)
+        exists = jwd in self._get_jwds()
+        if not exists:
+            self._write_record(jwd)
+        return exists
 
 
 class Severity:
@@ -86,6 +165,7 @@ class Severity:
 
 
 VALID_SEVERITIES = (Severity(0, "LOW"), Severity(1, "MEDIUM"), Severity(2, "HIGH"))
+notification_history = NotificationHistory(NOTIFICATION_HISTORY_FILE)
 
 
 def convert_str_to_severity(test_level: str) -> Severity:
@@ -207,6 +287,16 @@ Use like 'grep' after the gxadmin query queue-details command.",
         "--interactive",
         action="store_true",
         help="Show table header.",
+    )
+    my_parser.add_argument(
+        "--slack-alerts",
+        action="store_true",
+        help=(
+            "Report matches to a Slack channel defined with env variables"
+            " [SLACK_API_TOKEN, SLACK_CHANNEL_ID], where the Slack token"
+            " authenticates a Slack App with permission to post in your"
+            " Workspace."
+        ),
     )
     my_parser.add_argument(
         "--delete-user",
@@ -393,6 +483,30 @@ class Case:
             self.malware.version,
             self.job.files[self.fileindex],
         )
+
+    def post_slack_alert(self):
+        if notification_history.contains(self.job.jwd):
+            logger.debug("Skipping Slack notification - already posted for this JWD")
+            return
+        msg = f"""
+:rotating_light: WALLE: *Malware detected* :rotating_light:
+
+- *Hostname*: {os.getenv('WALLE_HOSTNAME')}
+- *Severity*: {self.malware.severity.name}
+- *User*: {self.job.user_id} ({self.job.user_name})
+- *User email*: {self.job.user_mail}
+- *Tool*: {self.job.tool_id}
+- *Galaxy job ID*: {self.job.galaxy_id}
+- *Runner job ID*: {self.job.runner_id}
+- *Runner name*: {self.job.runner_name}
+- *Object store ID*: {self.job.object_store_id}
+- *Malware class*: {self.malware.malware_class}
+- *Malware name*: {self.malware.program}
+- *Malware version*: {self.malware.version}
+- *File*: {self.job.files[self.fileindex]}
+- *Job working dir*: {self.job.jwd}
+"""
+        post_slack_msg(msg)
 
 
 def file_accessed_in_range(
@@ -708,7 +822,7 @@ class GalaxyAPI:
                     "role_ids": [],
                 },
                 "notification": {
-                    "source": "string",
+                    "source": "WALLE",
                     "category": "message",
                     "variant": "urgent",
                     "content": {
@@ -720,8 +834,7 @@ class GalaxyAPI:
             },
         )
         if response.status_code == 200:
-            if response.json()["total_notifications_sent"] == 1:
-                return True
+            return True
         logger.error(
             "Can not notify user %s, response from Galaxy: %s",
             encoded_user_id,
@@ -784,6 +897,32 @@ def get_database_with_password() -> RunningJobDatabase:
     )
 
 
+def post_slack_msg(message):
+    """Post a message to Slack."""
+    key = os.getenv("SLACK_API_TOKEN")
+    channel_id = os.getenv("SLACK_CHANNEL_ID")
+
+    if not all([key, channel_id]):
+        logger.warning(
+            "Slack notifications cannot be sent. Make sure your"
+            " playbook defines required vars:"
+            " [walle_slack_api_token, walle_slack_channel_id]."
+        )
+        return
+
+    logger.info(f"Posting incident report to Slack channel {channel_id}...")
+    requests.post(
+        SLACK_URL,
+        json={
+            "text": message,
+            "channel": channel_id,
+        },
+        headers={
+            "Authorization": f"Bearer {key}",
+        },
+    )
+
+
 def main():
     args = make_parser().parse_args()
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
@@ -824,6 +963,8 @@ def main():
                 reported_users.update(case.report_according_to_verbosity())
                 if args.delete_user:
                     delete_users.update(case.mark_user_for_deletion(args.delete_user))
+                if args.slack_alerts:
+                    case.post_slack_alert()
             if matching_malware and args.kill:
                 kill_job(job)
     # Deletes users at the end, to report all malicious jobs of a user
